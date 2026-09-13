@@ -9,8 +9,11 @@ const nodemailer = require("nodemailer");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DB_FILE = path.join(__dirname, "data", "db.json");
-const UPLOAD_DIR = path.join(__dirname, "data", "uploads");
+// DATA_DIR can point at a persistent hosting volume (for example /data on
+// Railway). Without it, local development continues to use ./data unchanged.
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
+const DB_FILE = path.join(DATA_DIR, "db.json");
+const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 const ADMIN_RESET_EMAIL = process.env.ADMIN_RESET_EMAIL || "bdenfo@gmail.com";
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || `http://localhost:${PORT}`)
@@ -28,16 +31,22 @@ app.use((req, res, next) => {
   if (IS_PRODUCTION) res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   next();
 });
-app.use(cors({
-  origin(origin, callback) {
-    // Requests from the same site and non-browser tools have no Origin header.
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-    return callback(new Error("Origin is not allowed"));
-  },
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: false
-}));
+app.use((req, res, next) => {
+  const origin = req.get("origin");
+  let sameSite = false;
+  try { sameSite = new URL(origin).host === req.get("host"); } catch {}
+  // Same-site browser calls work automatically; cross-site calls must be
+  // explicitly listed in ALLOWED_ORIGINS.
+  if (origin && !sameSite && !ALLOWED_ORIGINS.includes(origin)) return res.status(403).json({ error: "Origin is not allowed" });
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  }
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public"), { dotfiles: "deny", index: false }));
 

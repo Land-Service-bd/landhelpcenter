@@ -19,6 +19,12 @@ Before publishing:
 6. Restrict hosting-panel, database, and backup access with MFA and separate
    admin accounts. Review server logs and backups regularly.
 
+## Railway deployment
+
+Attach a Railway Volume at `/data` and set `DATA_DIR=/data` in the Railway
+service variables. This preserves the JSON database and uploaded files across
+deployments. Do not use a temporary filesystem for production data.
+
 No internet-connected system can promise that it will never be attacked. These
 controls reduce common risks; keeping the server, dependencies, TLS, secrets,
 and backups maintained is still necessary.
