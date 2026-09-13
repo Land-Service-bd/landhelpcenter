@@ -3,15 +3,20 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const crypto = require("crypto");
 const multer = require("multer");
 const nodemailer = require("nodemailer");
+// The hosted deployment installs pg. Local JSON-based development does not
+// need the driver, so keep it optional when POSTGRES_URL is absent.
+const { Pool } = process.env.POSTGRES_URL ? require("pg") : { Pool: null };
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 // DATA_DIR can point at a persistent hosting volume (for example /data on
 // Railway). Without it, local development continues to use ./data unchanged.
-const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
+const VERCEL_TMP_DIR = process.platform === "win32" ? path.join(os.tmpdir(), "customer-management-data") : "/tmp/customer-management-data";
+const DATA_DIR = path.resolve(process.env.DATA_DIR || (process.env.VERCEL ? VERCEL_TMP_DIR : path.join(__dirname, "data")));
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 const ADMIN_RESET_EMAIL = process.env.ADMIN_RESET_EMAIL || "bdenfo@gmail.com";
@@ -48,6 +53,11 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: "2mb" }));
+// On Vercel, restore the persistent PostgreSQL state before any route reads it.
+app.use(async (req, res, next) => {
+  try { await ensureState(); next(); }
+  catch (error) { console.error("Database initialization failed:", error.message); res.status(503).json({ error: "Database is temporarily unavailable" }); }
+});
 app.use(express.static(path.join(__dirname, "public"), { dotfiles: "deny", index: false }));
 
 const requestBuckets = new Map();
@@ -74,11 +84,10 @@ function verifyPassword(password, user) {
     return false;
   }
 }
-function loadDB() {
-  if (!fs.existsSync(DB_FILE)) {
+function createInitialDB() {
     const admin = hashPassword("admin123");
     const manager = hashPassword("manager123");
-    const db = {
+    return {
       users: [
         { id: 1, customerId: "ADM-0001", name: "Main Admin", phone: "admin", email: "", role: "ADMIN", balance: 0, ...admin },
         { id: 2, customerId: "MGR-0001", name: "Manager", phone: "manager", email: "", role: "MANAGER", balance: 0, ...manager }
@@ -96,16 +105,17 @@ function loadDB() {
       transactions: [],
       next: { user: 3, topup: 1, service: 4, order: 1, transaction: 1, supportMessage: 1 }
     };
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-  }
+}
+function loadLocalDB() {
+  if (!fs.existsSync(DB_FILE)) return createInitialDB();
   return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
 }
-let db = loadDB();
+let db = process.env.POSTGRES_URL ? createInitialDB() : loadLocalDB();
 (db.services || []).forEach(s => { if (!Array.isArray(s.formFields)) s.formFields = []; if (typeof s.allowExtraFiles !== "boolean") s.allowExtraFiles = false; if (!Number.isFinite(Number(s.businessDiscountPercent))) s.businessDiscountPercent = 0; });
 (db.orders || []).forEach(o => { if (!Array.isArray(o.files)) o.files = []; if (!o.formData) o.formData = {}; });
 if (!Array.isArray(db.supportMessages)) db.supportMessages = [];
 if (!Array.isArray(db.passwordResetCodes)) db.passwordResetCodes = [];
-if (!Array.isArray(db.notifications)) { db.notifications = []; save(); }
+if (!Array.isArray(db.notifications)) db.notifications = [];
 if (!Array.isArray(db.coupons)) db.coupons = [];
 function notify(userId, text, target = {}) { const kind = target.kind || "general"; db.notifications.push({ id: crypto.randomBytes(8).toString("hex"), userId, text: String(text).slice(0, 500), category: target.category || (kind === "support" || kind === "password-reset" ? "message" : "general"), kind, targetId: target.targetId ?? null, customerId: target.customerId ?? null, read: false, createdAt: new Date().toISOString() }); }
 if (!db.siteSettings) db.siteSettings = { headerTitle: "Customer Management", headerSubtitle: "Phase 5 — Order System", footerText: "Customer Management System • Phase 5 • Order + Top-up", uiLabels: {}, homepage: {}, colors: {}, logoUrl: "", replyFee: 0 };
@@ -122,8 +132,42 @@ if (!db.siteSettings.topupConfig || typeof db.siteSettings.topupConfig !== "obje
 if (!Array.isArray(db.siteSettings.topupConfig.others)) db.siteSettings.topupConfig.others = [];
 if (!db.managerPermissions || typeof db.managerPermissions !== "object") db.managerPermissions = { orders: true, topups: true, services: true, support: true, replies: true };
 if (!db.next.supportMessage) db.next.supportMessage = 1;
+const statePool = process.env.POSTGRES_URL ? new Pool({ connectionString: process.env.POSTGRES_URL, ssl: { rejectUnauthorized: false } }) : null;
+let stateReadyPromise;
+let writeQueue = Promise.resolve();
+function normalizeState() {
+  (db.services || []).forEach(s => { if (!Array.isArray(s.formFields)) s.formFields = []; if (typeof s.allowExtraFiles !== "boolean") s.allowExtraFiles = false; if (!Number.isFinite(Number(s.businessDiscountPercent))) s.businessDiscountPercent = 0; });
+  (db.orders || []).forEach(o => { if (!Array.isArray(o.files)) o.files = []; if (!o.formData) o.formData = {}; });
+  if (!Array.isArray(db.supportMessages)) db.supportMessages = [];
+  if (!Array.isArray(db.passwordResetCodes)) db.passwordResetCodes = [];
+  if (!Array.isArray(db.notifications)) db.notifications = [];
+  if (!Array.isArray(db.coupons)) db.coupons = [];
+  if (!db.next) db.next = { user: 3, topup: 1, service: 4, order: 1, transaction: 1, supportMessage: 1 };
+  if (!db.next.supportMessage) db.next.supportMessage = 1;
+}
+async function ensureState() {
+  if (!statePool) return;
+  if (!stateReadyPromise) stateReadyPromise = (async () => {
+    await statePool.query("create table if not exists cms_app_state (state_key text primary key, payload jsonb not null, updated_at timestamptz not null default now())");
+    const saved = await statePool.query("select payload from cms_app_state where state_key = 'primary'");
+    if (saved.rowCount) db = saved.rows[0].payload;
+    else {
+      const seed = fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE, "utf8")) : createInitialDB();
+      db = seed;
+      await statePool.query("insert into cms_app_state (state_key, payload) values ('primary', $1::jsonb)", [JSON.stringify(db)]);
+    }
+    normalizeState();
+  })();
+  return stateReadyPromise;
+}
 function save() {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+  if (!statePool) { fs.mkdirSync(path.dirname(DB_FILE), { recursive: true }); fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); return Promise.resolve(); }
+  // Serialize writes so concurrent serverless requests never overwrite each other.
+  writeQueue = writeQueue.then(async () => {
+    await ensureState();
+    await statePool.query("update cms_app_state set payload = $1::jsonb, updated_at = now() where state_key = 'primary'", [JSON.stringify(db)]);
+  }).catch(error => console.error("Database save failed:", error.message));
+  return writeQueue;
 }
 function nextId(k) {
   return db.next[k]++;
@@ -164,7 +208,56 @@ function createOtp(userId, purpose, channel) {
 }
 const sessions = new Map();
 
-const storage = multer.diskStorage({
+const cloudStorageEnabled = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
+const SUPABASE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "cms-documents";
+let bucketReadyPromise = null;
+
+// Vercel's local filesystem is temporary.  Production uploads therefore go to
+// the connected Supabase Storage bucket; local development keeps using /uploads.
+async function ensureCloudBucket() {
+  if (!cloudStorageEnabled) return false;
+  if (!bucketReadyPromise) bucketReadyPromise = (async () => {
+    const response = await fetch(`${process.env.SUPABASE_URL}/storage/v1/bucket`, {
+      method: "POST",
+      headers: {
+        apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ id: SUPABASE_BUCKET, name: SUPABASE_BUCKET, public: false })
+    });
+    // A duplicate-bucket response simply means a previous request created it.
+    if (!response.ok && response.status !== 409) throw new Error(`Storage bucket unavailable (${response.status})`);
+    return true;
+  })();
+  return bucketReadyPromise;
+}
+function cloudObjectPath(key) {
+  return key.split("/").map(encodeURIComponent).join("/");
+}
+async function putCloudFile(key, file) {
+  await ensureCloudBucket();
+  const response = await fetch(`${process.env.SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${cloudObjectPath(key)}`, {
+    method: "POST",
+    headers: {
+      apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": file.mimetype || "application/octet-stream",
+      "x-upsert": "false"
+    },
+    body: file.buffer
+  });
+  if (!response.ok) throw new Error(`Storage upload failed (${response.status})`);
+}
+async function getCloudFile(key) {
+  const response = await fetch(`${process.env.SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${cloudObjectPath(key)}`, {
+    headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}` }
+  });
+  if (!response.ok) return null;
+  return Buffer.from(await response.arrayBuffer());
+}
+
+const diskStorage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
     const safe = path.basename(file.originalname || "file").replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120);
@@ -172,7 +265,7 @@ const storage = multer.diskStorage({
   }
 });
 const upload = multer({
-  storage,
+  storage: cloudStorageEnabled ? multer.memoryStorage() : diskStorage,
   limits: { fileSize: 50 * 1024 * 1024, files: 10 },
   fileFilter: (req, file, cb) => {
     const allowed = new Set([
@@ -185,28 +278,35 @@ const upload = multer({
     cb(null, true);
   }
 });
-function saveUploadedFiles(files, uploadedBy, orderId) {
-  return (files || []).map(f => ({
-    id: crypto.randomBytes(10).toString("hex"),
-    orderId,
-    originalName: f.originalname,
-    storedName: f.filename,
-    mimeType: f.mimetype || "application/octet-stream",
-    size: f.size,
-    uploadedBy: uploadedBy.id,
-    uploadedByName: uploadedBy.name,
-    uploadedAt: new Date().toISOString()
-  }));
+async function saveUploadedFiles(files, uploadedBy, orderId) {
+  const saved = [];
+  for (const f of files || []) {
+    const safe = path.basename(f.originalname || "file").replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "file";
+    const storedName = cloudStorageEnabled ? `${Date.now()}-${crypto.randomBytes(10).toString("hex")}-${safe}` : f.filename;
+    if (cloudStorageEnabled) await putCloudFile(`orders/${orderId}/${storedName}`, f);
+    saved.push({
+      id: crypto.randomBytes(10).toString("hex"), orderId, originalName: f.originalname,
+      storedName, storage: cloudStorageEnabled ? "supabase" : "local",
+      mimeType: f.mimetype || "application/octet-stream", size: f.size,
+      uploadedBy: uploadedBy.id, uploadedByName: uploadedBy.name, uploadedAt: new Date().toISOString()
+    });
+  }
+  return saved;
 }
 
 function currentUser(req) {
   const t = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-  const session = t ? sessions.get(t) : null;
+  const session = t ? (sessions.get(t) || db.sessions?.[t]) : null;
   if (!session || session.expiresAt <= Date.now()) {
-    if (t) sessions.delete(t);
+    if (t) { sessions.delete(t); if (db.sessions) { delete db.sessions[t]; save(); } }
     return null;
   }
   return db.users.find(u => u.id === session.userId) || null;
+}
+function revokeSessions(userId) {
+  for (const [key, session] of sessions) if (session.userId === userId) sessions.delete(key);
+  if (!db.sessions) return;
+  for (const [key, session] of Object.entries(db.sessions)) if (session.userId === userId) delete db.sessions[key];
 }
 function auth(req, res, next) {
   const u = currentUser(req);
@@ -317,7 +417,11 @@ app.post("/api/customer/login", authRateLimit, (req, res) => {
     return res.status(401).json({ error: "Username/Mobile অথবা Password ভুল" });
   }
   const t = token();
-  sessions.set(t, { userId: u.id, expiresAt: Date.now() + 8 * 60 * 60 * 1000 });
+  const session = { userId: u.id, expiresAt: Date.now() + 8 * 60 * 60 * 1000 };
+  sessions.set(t, session);
+  if (!db.sessions) db.sessions = {};
+  db.sessions[t] = session;
+  save();
   res.json({ success: true, token: t, customer: publicUser(u), mustSetPassword: Boolean(u.forcePasswordReset) });
 });
 app.post("/api/customer/set-password", auth, (req, res) => {
@@ -329,7 +433,7 @@ app.post("/api/customer/set-password", auth, (req, res) => {
 
 app.post("/api/customer/logout", auth, (req, res) => {
   const t = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-  if (t) sessions.delete(t);
+  if (t) { sessions.delete(t); if (db.sessions) delete db.sessions[t]; save(); }
   res.json({ success: true });
 });
 app.get("/api/customer/me", auth, (req, res) => res.json({ customer: publicUser(req.user) }));
@@ -356,7 +460,7 @@ app.post("/api/customer/password-recovery", authRateLimit, (req, res) => {
   const reset = u && db.passwordResetCodes.find(x => x.userId === u.id && x.purpose === "customer-reset" && x.codeHash === otpHash(code) && x.expiresAt > Date.now());
   if (!reset) return res.status(400).json({ error: "OTP ভুল অথবা মেয়াদ শেষ" });
   Object.assign(u, hashPassword(newPassword)); db.passwordResetCodes = db.passwordResetCodes.filter(x => x !== reset);
-  for (const [key, session] of sessions) if (session.userId === u.id) sessions.delete(key);
+  revokeSessions(u.id);
   save(); res.json({ success: true, message: "পাসওয়ার্ড পরিবর্তন হয়েছে। এখন নতুন পাসওয়ার্ড দিয়ে লগইন করুন।" });
 });
 
@@ -388,7 +492,7 @@ app.post("/api/admin/password-recovery/confirm", authRateLimit, (req, res) => {
   if (!u) return res.status(404).json({ error: "Admin account পাওয়া যায়নি" });
   Object.assign(u, hashPassword(newPassword));
   db.passwordResetCodes = db.passwordResetCodes.filter(x => x !== reset);
-  for (const [key, session] of sessions) if (session.userId === u.id) sessions.delete(key);
+  revokeSessions(u.id);
   save();
   res.json({ success: true, message: "Admin password পরিবর্তন হয়েছে। নতুন password দিয়ে Login করুন।" });
 });
@@ -530,7 +634,7 @@ function serviceAllowsFiles(service) {
   return Boolean(service.allowExtraFiles) || (service.formFields || []).some(f => f.type === "file");
 }
 
-app.post("/api/orders", auth, upload.array("files", 10), (req, res) => {
+app.post("/api/orders", auth, upload.array("files", 10), async (req, res) => {
   if (!isClient(req.user)) return res.status(403).json({ error: "শুধু Customer বা Business Customer Order করতে পারবে" });
   const s = db.services.find(x => x.id == req.body.serviceId && x.active);
   if (!s) return res.status(404).json({ error: "Service not found" });
@@ -558,7 +662,7 @@ app.post("/api/orders", auth, upload.array("files", 10), (req, res) => {
     details, formData, formFields: JSON.parse(JSON.stringify(s.formFields || [])), files: [], amount, status: "PENDING", createdAt: new Date().toISOString(),
     approvedBy: null, approvedAt: null, note: "", couponCode: coupon?.code || "", couponPercent: coupon?.percent || 0
   };
-  o.files = saveUploadedFiles(req.files, req.user, o.id);
+  o.files = await saveUploadedFiles(req.files, req.user, o.id);
   db.orders.push(o);
   db.users.filter(u => ["ADMIN", "MANAGER"].includes(u.role)).forEach(u => notify(u.id, `${o.customerId} নতুন Order করেছেন: ${o.orderNo}`, { category: "general", kind: "order", targetId: o.id, customerId: o.customerId }));
   save();
@@ -568,20 +672,27 @@ app.get("/api/orders", auth, (req, res) => {
   const list = isClient(req.user) ? db.orders.filter(o => o.userId === req.user.id) : db.orders;
   res.json(list);
 });
-app.post("/api/orders/:id/files", auth, staff, upload.array("files", 10), (req, res) => {
+app.post("/api/orders/:id/files", auth, staff, upload.array("files", 10), async (req, res) => {
   const o = db.orders.find(x => x.id == req.params.id);
   if (!o) return res.status(404).json({ error: "Order not found" });
   if (!req.files?.length) return res.status(400).json({ error: "একটি বা একাধিক file নির্বাচন করুন" });
   if (!Array.isArray(o.files)) o.files = [];
-  const added = saveUploadedFiles(req.files, req.user, o.id);
+  const added = await saveUploadedFiles(req.files, req.user, o.id);
   o.files.push(...added); save();
   res.json({ success: true, files: added, order: o });
 });
-app.get("/api/files/:fileId", auth, (req, res) => {
+app.get("/api/files/:fileId", auth, async (req, res) => {
   const o = db.orders.find(x => Array.isArray(x.files) && x.files.some(f => f.id === req.params.fileId));
   if (!o) return res.status(404).json({ error: "File not found" });
   const f = o.files.find(x => x.id === req.params.fileId);
   if (isClient(req.user) && o.userId !== req.user.id) return res.status(403).json({ error: "Access denied" });
+  if (f.storage === "supabase") {
+    const content = await getCloudFile(`orders/${o.id}/${f.storedName}`);
+    if (!content) return res.status(404).json({ error: "Stored file not found" });
+    res.setHeader("Content-Type", f.mimeType || "application/octet-stream");
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(f.originalName)}`);
+    return res.send(content);
+  }
   const full = path.join(UPLOAD_DIR, f.storedName);
   if (!fs.existsSync(full)) return res.status(404).json({ error: "Stored file not found" });
   res.download(full, f.originalName);
@@ -607,7 +718,7 @@ app.post("/api/orders/:id/reject", auth, staff, (req, res) => {
 });
 // A customer may send one correction reply after an approved order.  Files are
 // stored with the order so the staff and that customer can download them safely.
-app.post("/api/orders/:id/reply", auth, upload.array("files", 10), (req, res) => {
+app.post("/api/orders/:id/reply", auth, upload.array("files", 10), async (req, res) => {
   const o = db.orders.find(x => x.id == req.params.id);
   if (!o || o.userId !== req.user.id || !isClient(req.user)) return res.status(404).json({ error: "Order পাওয়া যায়নি" });
   if (o.status !== "APPROVED") return res.status(400).json({ error: "শুধু Confirm হওয়া Order-এ reply দেওয়া যাবে" });
@@ -621,7 +732,7 @@ app.post("/api/orders/:id/reply", auth, upload.array("files", 10), (req, res) =>
     db.transactions.push({ id: nextId("transaction"), userId: req.user.id, type: "ORDER_REPLY_FEE", amount: -replyFee, balanceAfter: req.user.balance, reference: o.orderNo, createdAt: new Date().toISOString() });
   }
   if (!Array.isArray(o.files)) o.files = [];
-  const files = saveUploadedFiles(req.files, req.user, o.id);
+  const files = await saveUploadedFiles(req.files, req.user, o.id);
   o.files.push(...files);
   o.customerReply = { message, files: files.map(f => f.id), fee: replyFee, status: "PENDING", createdAt: new Date().toISOString() };
   db.users.filter(u => ["ADMIN", "MANAGER"].includes(u.role)).forEach(u => notify(u.id, `${o.customerId} একটি Order Reply পাঠিয়েছেন`, { category: "general", kind: "order-reply", targetId: o.id, customerId: o.customerId }));
@@ -690,7 +801,7 @@ app.put("/api/admin/users/:id/password", auth, admin, (req, res) => {
   const password = String(req.body?.password || "");
   if (!u || password.length < 8) return res.status(400).json({ error: "কমপক্ষে ৮ অক্ষরের নতুন পাসওয়ার্ড দিন" });
   Object.assign(u, hashPassword(password));
-  for (const [key, session] of sessions) if (session.userId === u.id) sessions.delete(key);
+  revokeSessions(u.id);
   save();
   res.json({ success: true });
 });
@@ -701,7 +812,7 @@ app.delete("/api/admin/users/:id", auth, admin, (req, res) => {
   if (!u) return res.status(404).json({ error: "User not found" });
   if (u.id === req.user.id || u.role === "ADMIN") return res.status(403).json({ error: "নিজের বা অন্য Admin account Delete করা যাবে না" });
   db.users.splice(index, 1);
-  for (const [key, session] of sessions) if (session.userId === id) sessions.delete(key);
+  revokeSessions(id);
   db.supportMessages = (db.supportMessages || []).filter(m => m.customerId !== id && m.senderId !== id);
   db.notifications = (db.notifications || []).filter(n => n.userId !== id);
   save(); res.json({ success: true });
@@ -800,19 +911,29 @@ app.put("/api/admin/site-settings", auth, admin, (req, res) => {
   db.siteSettings = { headerTitle, headerSubtitle, footerText, uiLabels, homepage, colors, logoUrl: db.siteSettings.logoUrl || "", replyFee };
   save(); res.json({ success: true, settings: db.siteSettings });
 });
-app.post("/api/admin/site-settings/logo", auth, admin, upload.single("logo"), (req, res) => {
+app.post("/api/admin/site-settings/logo", auth, admin, upload.single("logo"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "একটি image নির্বাচন করুন" });
   if (!String(req.file.mimetype || "").startsWith("image/")) return res.status(400).json({ error: "শুধু image file গ্রহণ করা হয়" });
-  db.siteSettings.logoUrl = `/api/public/logo/${req.file.filename}`;
+  const safe = path.basename(req.file.originalname || "logo").replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "logo";
+  const storedName = cloudStorageEnabled ? `${Date.now()}-${crypto.randomBytes(10).toString("hex")}-${safe}` : req.file.filename;
+  if (cloudStorageEnabled) await putCloudFile(`logos/${storedName}`, req.file);
+  db.siteSettings.logoUrl = `/api/public/logo/${storedName}`;
   save(); res.json({ success: true, logoUrl: db.siteSettings.logoUrl });
 });
 
 // Documents are never public URLs.  The existing authenticated /api/files/:id
 // route authorizes each download.  Only the active public logo is exposed here.
-app.get("/api/public/logo/:name", (req, res) => {
+app.get("/api/public/logo/:name", async (req, res) => {
   const expected = path.basename(String(db.siteSettings?.logoUrl || ""));
   const name = path.basename(req.params.name);
   if (!expected || name !== expected) return res.status(404).end();
+  if (cloudStorageEnabled) {
+    const content = await getCloudFile(`logos/${name}`);
+    if (!content) return res.status(404).end();
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.type(path.extname(name));
+    return res.send(content);
+  }
   const full = path.join(UPLOAD_DIR, name);
   if (!fs.existsSync(full)) return res.status(404).end();
   res.setHeader("Cache-Control", "public, max-age=3600");
@@ -832,4 +953,5 @@ app.use((err, req, res, next) => {
 });
 
 app.get("*", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
-app.listen(PORT, () => console.log(`Customer Management System Phase 5.3 running: http://localhost:${PORT}`));
+if (!process.env.VERCEL) app.listen(PORT, () => console.log(`Customer Management System Phase 5.3 running: http://localhost:${PORT}`));
+module.exports = app;

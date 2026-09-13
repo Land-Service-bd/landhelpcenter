@@ -1,0 +1,7 @@
+{
+  "version": 2,
+  "buildCommand": "npm install --no-package-lock --no-audit --no-fund",
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index.js" }
+  ]
+}
