@@ -1,0 +1,18 @@
+{
+  "name": "customer-management-system-phase5",
+  "version": "5.3.0",
+  "private": true,
+  "description": "Customer Management System - Phase 5.3 Dynamic Forms and Order Documents",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.9.16"
+  }
+}

@@ -1,0 +1,4 @@
+.env
+data/db.json
+data/uploads/
+node_modules/
