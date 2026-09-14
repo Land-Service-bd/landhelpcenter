@@ -234,7 +234,83 @@ const sessions = new Map();
 
 const cloudStorageEnabled = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
 const SUPABASE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "cms-documents";
+const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || "";
+// Google Drive is an optional replacement for document storage. Personal
+// Google Drive accounts use OAuth; a Workspace Shared Drive may alternatively
+// use a service account. All credentials stay only in Vercel Environment
+// Variables and must never be committed.
+const googleDriveOAuthEnabled = Boolean(
+  GOOGLE_DRIVE_FOLDER_ID && process.env.GOOGLE_DRIVE_CLIENT_ID &&
+  process.env.GOOGLE_DRIVE_CLIENT_SECRET && process.env.GOOGLE_DRIVE_REFRESH_TOKEN
+);
+const googleDriveServiceAccountEnabled = Boolean(
+  GOOGLE_DRIVE_FOLDER_ID && process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL &&
+  process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
+);
+const googleDriveEnabled = googleDriveOAuthEnabled || googleDriveServiceAccountEnabled;
+let googleAccessToken = null;
+let googleAccessTokenExpiresAt = 0;
 let bucketReadyPromise = null;
+
+function base64url(value) { return Buffer.from(value).toString("base64url"); }
+async function googleDriveToken() {
+  if (!googleDriveEnabled) throw new Error("Google Drive is not configured");
+  if (googleAccessToken && googleAccessTokenExpiresAt > Date.now() + 60 * 1000) return googleAccessToken;
+  if (googleDriveOAuthEnabled) {
+    const body = new URLSearchParams({
+      client_id: process.env.GOOGLE_DRIVE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_DRIVE_CLIENT_SECRET,
+      refresh_token: process.env.GOOGLE_DRIVE_REFRESH_TOKEN,
+      grant_type: "refresh_token"
+    });
+    const response = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.access_token) throw new Error(`Google Drive authentication failed (${response.status})`);
+    googleAccessToken = result.access_token;
+    googleAccessTokenExpiresAt = Date.now() + Math.max(60, Number(result.expires_in || 3600) - 60) * 1000;
+    return googleAccessToken;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const claim = base64url(JSON.stringify({
+    iss: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    scope: "https://www.googleapis.com/auth/drive.file",
+    aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600
+  }));
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(`${header}.${claim}`); signer.end();
+  const privateKey = String(process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY).replace(/\\n/g, "\n");
+  const assertion = `${header}.${claim}.${signer.sign(privateKey, "base64url")}`;
+  const body = new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion });
+  const response = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || !result.access_token) throw new Error(`Google Drive authentication failed (${response.status})`);
+  googleAccessToken = result.access_token;
+  googleAccessTokenExpiresAt = Date.now() + Math.max(60, Number(result.expires_in || 3600) - 60) * 1000;
+  return googleAccessToken;
+}
+async function putGoogleDriveFile(name, file) {
+  const boundary = `cms-${crypto.randomBytes(12).toString("hex")}`;
+  const metadata = JSON.stringify({ name, parents: [GOOGLE_DRIVE_FOLDER_ID] });
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n--${boundary}\r\nContent-Type: ${file.mimetype || "application/octet-stream"}\r\n\r\n`),
+    file.buffer,
+    Buffer.from(`\r\n--${boundary}--`)
+  ]);
+  const response = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true", {
+    method: "POST", headers: { Authorization: `Bearer ${await googleDriveToken()}`, "Content-Type": `multipart/related; boundary=${boundary}` }, body
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || !result.id) throw new Error(`Google Drive upload failed (${response.status})`);
+  return result.id;
+}
+async function getGoogleDriveFile(fileId) {
+  const response = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`, { headers: { Authorization: `Bearer ${await googleDriveToken()}` } });
+  if (!response.ok) return null;
+  return Buffer.from(await response.arrayBuffer());
+}
 
 // Vercel's local filesystem is temporary.  Production uploads therefore go to
 // the connected Supabase Storage bucket; local development keeps using /uploads.
@@ -289,7 +365,7 @@ const diskStorage = multer.diskStorage({
   }
 });
 const upload = multer({
-  storage: cloudStorageEnabled ? multer.memoryStorage() : diskStorage,
+  storage: (googleDriveEnabled || cloudStorageEnabled) ? multer.memoryStorage() : diskStorage,
   limits: { fileSize: 50 * 1024 * 1024, files: 10 },
   fileFilter: (req, file, cb) => {
     const allowed = new Set([
@@ -306,11 +382,12 @@ async function saveUploadedFiles(files, uploadedBy, orderId) {
   const saved = [];
   for (const f of files || []) {
     const safe = path.basename(f.originalname || "file").replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "file";
-    const storedName = cloudStorageEnabled ? `${Date.now()}-${crypto.randomBytes(10).toString("hex")}-${safe}` : f.filename;
-    if (cloudStorageEnabled) await putCloudFile(`orders/${orderId}/${storedName}`, f);
+    const storedName = (googleDriveEnabled || cloudStorageEnabled) ? `${Date.now()}-${crypto.randomBytes(10).toString("hex")}-${safe}` : f.filename;
+    const driveFileId = googleDriveEnabled ? await putGoogleDriveFile(`order-${orderId}-${storedName}`, f) : null;
+    if (!googleDriveEnabled && cloudStorageEnabled) await putCloudFile(`orders/${orderId}/${storedName}`, f);
     saved.push({
       id: crypto.randomBytes(10).toString("hex"), orderId, originalName: f.originalname,
-      storedName, storage: cloudStorageEnabled ? "supabase" : "local",
+      storedName, storage: googleDriveEnabled ? "google-drive" : (cloudStorageEnabled ? "supabase" : "local"), driveFileId,
       mimeType: f.mimetype || "application/octet-stream", size: f.size,
       uploadedBy: uploadedBy.id, uploadedByName: uploadedBy.name, uploadedAt: new Date().toISOString()
     });
@@ -716,6 +793,13 @@ app.get("/api/files/:fileId", auth, async (req, res) => {
   if (!o) return res.status(404).json({ error: "File not found" });
   const f = o.files.find(x => x.id === req.params.fileId);
   if (isClient(req.user) && o.userId !== req.user.id) return res.status(403).json({ error: "Access denied" });
+  if (f.storage === "google-drive") {
+    const content = await getGoogleDriveFile(f.driveFileId);
+    if (!content) return res.status(404).json({ error: "Stored file not found" });
+    res.setHeader("Content-Type", f.mimeType || "application/octet-stream");
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(f.originalName)}`);
+    return res.send(content);
+  }
   if (f.storage === "supabase") {
     const content = await getCloudFile(`orders/${o.id}/${f.storedName}`);
     if (!content) return res.status(404).json({ error: "Stored file not found" });
