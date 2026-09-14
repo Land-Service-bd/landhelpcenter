@@ -70,7 +70,30 @@ function rateLimit({ windowMs, max, key = req => req.ip }) {
   };
 }
 app.use("/api", rateLimit({ windowMs: 15 * 60 * 1000, max: 300 }));
-const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10 });
+// Authentication pages may legitimately make several requests while the UI
+// restores a session.  This is deliberately generous; password failures are
+// still rate-limited separately below.
+const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
+const failedLoginBuckets = new Map();
+function loginAttemptKey(req, identifier) { return `${req.ip}:${identifier}`; }
+function rejectTooManyLoginAttempts(req, res, identifier) {
+  const key = loginAttemptKey(req, identifier), now = Date.now();
+  const hits = (failedLoginBuckets.get(key) || []).filter(time => time > now - 15 * 60 * 1000);
+  if (hits.length >= 10) { failedLoginBuckets.set(key, hits); res.status(429).json({ error: "নিরাপত্তার জন্য অনেকবার ভুল Login চেষ্টা করা হয়েছে। ১৫ মিনিট পরে আবার চেষ্টা করুন।" }); return true; }
+  return false;
+}
+function recordFailedLogin(req, identifier) {
+  const key = loginAttemptKey(req, identifier), now = Date.now();
+  const hits = (failedLoginBuckets.get(key) || []).filter(time => time > now - 15 * 60 * 1000);
+  hits.push(now); failedLoginBuckets.set(key, hits);
+}
+function clearFailedLogin(req, identifier) { failedLoginBuckets.delete(loginAttemptKey(req, identifier)); }
+function normalizeLoginIdentifier(value) {
+  const trimmed = String(value ?? "").trim();
+  // Allow customers to type a registered mobile number with spaces or dashes,
+  // but retain ordinary usernames such as "admin" unchanged.
+  return /^[+0-9()\s-]+$/.test(trimmed) ? trimmed.replace(/[\s()-]/g, "") : trimmed.toLowerCase();
+}
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
   const hash = crypto.scryptSync(String(password), salt, 64).toString("hex");
@@ -144,6 +167,7 @@ function normalizeState() {
   if (!Array.isArray(db.coupons)) db.coupons = [];
   if (!db.next) db.next = { user: 3, topup: 1, service: 4, order: 1, transaction: 1, supportMessage: 1 };
   if (!db.next.supportMessage) db.next.supportMessage = 1;
+  if (!db.sessions || typeof db.sessions !== "object") db.sessions = {};
 }
 async function ensureState() {
   if (!statePool) return;
@@ -377,15 +401,16 @@ app.get("/api/health", (req, res) => res.json({ ok: true, phase: "5.3" }));
 app.get("/api/site-settings", (req, res) => res.json(db.siteSettings));
 
 // ---------- Authentication ----------
-app.post("/api/customer/register", authRateLimit, (req, res) => {
+app.post("/api/customer/register", authRateLimit, async (req, res) => {
   const { name, phone, email = "", password } = req.body || {};
+  const normalizedPhone = normalizeLoginIdentifier(phone);
   if (!String(name || "").trim() || !String(phone || "").trim() || !String(password || "")) {
     return res.status(400).json({ error: "নাম, মোবাইল ও পাসওয়ার্ড দিন" });
   }
   if (String(name).trim().length > 100 || String(phone).trim().length > 30 || String(email).trim().length > 150 || String(password).length < 8) {
     return res.status(400).json({ error: "নাম/মোবাইল সঠিক দিন এবং পাসওয়ার্ড কমপক্ষে ৮ অক্ষরের ব্যবহার করুন" });
   }
-  if (db.users.some(u => u.phone === phone)) {
+  if (db.users.some(u => normalizeLoginIdentifier(u.phone) === normalizedPhone)) {
     return res.status(409).json({ error: "এই মোবাইল/Username আগে ব্যবহার হয়েছে" });
   }
   const id = nextId("user");
@@ -394,26 +419,29 @@ app.post("/api/customer/register", authRateLimit, (req, res) => {
     id,
     customerId: `CUS-${String(id).padStart(5, "0")}`,
     name: String(name).trim(),
-    phone: String(phone).trim(),
+    phone: normalizedPhone,
     email: String(email || "").trim(),
     role: "CUSTOMER",
     balance: 0,
     ...hp
   };
   db.users.push(u);
-  save();
+  await save();
   res.json({ success: true, customer: publicUser(u) });
 });
 
-app.post("/api/customer/login", authRateLimit, (req, res) => {
+app.post("/api/customer/login", authRateLimit, async (req, res) => {
   const { phone, password } = req.body || {};
-  const u = db.users.find(x => x.phone === phone);
+  const identifier = normalizeLoginIdentifier(phone);
+  if (rejectTooManyLoginAttempts(req, res, identifier)) return;
+  const u = db.users.find(x => normalizeLoginIdentifier(x.phone) === identifier);
   // A support-approved reset lets the customer retrieve the temporary password
   // by entering their registered phone number, before they sign in again.
   if (u?.forcePasswordReset && !String(password || "")) {
     return res.json({ success: true, requiresOtp: true, oneTimePassword: u.oneTimePassword, message: u.resetMessage || "Admin password reset অনুমোদন করেছেন।" });
   }
   if (!u || !verifyPassword(password, u)) {
+    recordFailedLogin(req, identifier);
     return res.status(401).json({ error: "Username/Mobile অথবা Password ভুল" });
   }
   const t = token();
@@ -421,13 +449,14 @@ app.post("/api/customer/login", authRateLimit, (req, res) => {
   sessions.set(t, session);
   if (!db.sessions) db.sessions = {};
   db.sessions[t] = session;
-  save();
+  clearFailedLogin(req, identifier);
+  await save();
   res.json({ success: true, token: t, customer: publicUser(u), mustSetPassword: Boolean(u.forcePasswordReset) });
 });
-app.post("/api/customer/set-password", auth, (req, res) => {
+app.post("/api/customer/set-password", auth, async (req, res) => {
   const password = String(req.body?.password || "");
   if (password.length < 8) return res.status(400).json({ error: "কমপক্ষে ৮ অক্ষরের নতুন পাসওয়ার্ড দিন" });
-  Object.assign(req.user, hashPassword(password)); delete req.user.forcePasswordReset; delete req.user.oneTimePassword; delete req.user.resetMessage; save();
+  Object.assign(req.user, hashPassword(password)); delete req.user.forcePasswordReset; delete req.user.oneTimePassword; delete req.user.resetMessage; await save();
   res.json({ success: true });
 });
 
@@ -443,7 +472,8 @@ app.get("/api/customer/me", auth, (req, res) => res.json({ customer: publicUser(
 // by an authenticated administrator below.
 app.post("/api/customer/password-recovery/request", authRateLimit, async (req, res) => {
   const { phone, channel } = req.body || {};
-  const u = db.users.find(x => isClient(x) && x.phone === String(phone || "").trim());
+  const normalizedPhone = normalizeLoginIdentifier(phone);
+  const u = db.users.find(x => isClient(x) && normalizeLoginIdentifier(x.phone) === normalizedPhone);
   if (!u || !["email", "sms"].includes(channel)) return res.status(400).json({ error: "সঠিক মোবাইল ও Email/SMS মাধ্যম নির্বাচন করুন" });
   if (channel === "email" && !u.email) return res.status(400).json({ error: "এই account-এ Email নেই; SMS OTP ব্যবহার করুন অথবা Admin-এর সঙ্গে যোগাযোগ করুন" });
   const code = createOtp(u.id, "customer-reset", channel);
