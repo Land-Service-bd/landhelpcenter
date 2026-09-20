@@ -72,7 +72,20 @@ app.get("/api/health", (req, res) => {
 });
 // On Vercel, restore the persistent PostgreSQL state before any route reads it.
 app.use(async (req, res, next) => {
-  try { await ensureState(); next(); }
+  try {
+    await ensureState();
+    // Vercel can route consecutive requests to different warm instances.
+    // Refresh authoritative PostgreSQL state on each request so sessions,
+    // balances, orders, top-ups and notifications stay visible everywhere.
+    if (statePool) {
+      const latest = await statePool.query("select payload from cms_app_state where state_key = 'primary'");
+      if (latest.rowCount) {
+        db = latest.rows[0].payload;
+        normalizeState();
+      }
+    }
+    next();
+  }
   catch (error) { console.error("Database initialization failed:", error.message); res.status(503).json({ error: "Database is temporarily unavailable" }); }
 });
 app.use(express.static(path.join(__dirname, "public"), { dotfiles: "deny", index: false }));
@@ -733,7 +746,12 @@ app.post("/api/topups", auth, (req, res) => {
     reviewedBy: null
   };
   db.topups.push(t);
-  save();
+  db.users.filter(u => ["ADMIN", "MANAGER"].includes(u.role)).forEach(u =>
+    notify(u.id, String(req.user.customerId) + " নতুন Top-up request: " + a + " টাকা (" + method + ")", {
+      category: "message", kind: "topup", targetId: t.id, customerId: req.user.customerId
+    })
+  );
+  await save();
   res.json({ success: true, topup: t });
 });
 app.get("/api/topups", auth, (req, res) => {
