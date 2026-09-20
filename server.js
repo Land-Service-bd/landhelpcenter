@@ -910,12 +910,42 @@ app.post("/api/orders/:id/reply/confirm", auth, staff, (req, res) => {
 app.put("/api/admin/orders/:id", auth, admin, (req, res) => {
   const o = db.orders.find(x => x.id == req.params.id);
   if (!o) return res.status(404).json({ error: "Order not found" });
+  const requestedStatus = req.body.status;
+  if (requestedStatus !== undefined && !["PENDING", "APPROVED", "REJECTED", "CANCELLED"].includes(requestedStatus)) {
+    return res.status(400).json({ error: "Invalid order status" });
+  }
+  const previousStatus = o.status;
+  const nextStatus = requestedStatus === undefined ? previousStatus : requestedStatus;
+  const u = db.users.find(x => x.id === o.userId);
+  if (!u || !isClient(u)) return res.status(400).json({ error: "Customer not found" });
+
+  // Keep the admin edit screen financially consistent with the normal
+  // Approve/Reject buttons: approving charges once; moving an approved order
+  // back to a non-approved state refunds that charge once.
+  if (previousStatus !== "APPROVED" && nextStatus === "APPROVED") {
+    if (o.amount > 0 && Number(u.balance || 0) < Number(o.amount)) {
+      return res.status(400).json({ error: "Customer balance is insufficient" });
+    }
+    if (o.amount > 0) {
+      u.balance = Number(u.balance) - Number(o.amount);
+      db.transactions.push({ id: nextId("transaction"), userId: u.id, type: "ORDER", amount: -Number(o.amount), balanceAfter: u.balance, reference: o.orderNo, createdAt: new Date().toISOString() });
+    }
+    o.approvedBy = req.user.id;
+    o.approvedAt = new Date().toISOString();
+  } else if (previousStatus === "APPROVED" && nextStatus !== "APPROVED") {
+    if (o.amount > 0) {
+      u.balance = Number(u.balance) + Number(o.amount);
+      db.transactions.push({ id: nextId("transaction"), userId: u.id, type: "ORDER_REFUND", amount: Number(o.amount), balanceAfter: u.balance, reference: o.orderNo, createdAt: new Date().toISOString() });
+    }
+    o.approvedBy = null;
+    o.approvedAt = null;
+  }
   if (req.body.serviceTitle !== undefined) o.serviceTitle = String(req.body.serviceTitle).trim().slice(0, 200);
   if (req.body.details !== undefined) o.details = String(req.body.details).trim().slice(0, 5000);
   if (req.body.note !== undefined) o.note = String(req.body.note).trim().slice(0, 2000);
-  if (req.body.status !== undefined && ["PENDING", "APPROVED", "REJECTED", "CANCELLED"].includes(req.body.status)) o.status = req.body.status;
+  o.status = nextStatus;
   o.updatedAt = new Date().toISOString(); o.updatedBy = req.user.id;
-  save(); res.json({ success: true, order: o });
+  save(); res.json({ success: true, order: o, balance: u.balance });
 });
 app.delete("/api/admin/orders/:id", auth, admin, (req, res) => {
   const index = db.orders.findIndex(x => x.id == req.params.id);
