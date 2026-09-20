@@ -53,6 +53,23 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: "2mb" }));
+
+// Lightweight deployment diagnostic. It never exposes credentials or tokens.
+// Keep this endpoint before database initialization so a broken DB connection
+// can be diagnosed from Vercel even when the application state is unavailable.
+app.get("/api/health", (req, res) => {
+  const database = process.env.POSTGRES_URL ? "postgres-configured" : "local-json-fallback";
+  const documentStorage = googleDriveEnabled ? "google-drive" : (cloudStorageEnabled ? "supabase" : "local-files");
+  res.json({
+    ok: true,
+    service: "landhelpcenter-api",
+    node: process.version,
+    vercel: Boolean(process.env.VERCEL),
+    database,
+    documentStorage,
+    timestamp: new Date().toISOString()
+  });
+});
 // On Vercel, restore the persistent PostgreSQL state before any route reads it.
 app.use(async (req, res, next) => {
   try { await ensureState(); next(); }
