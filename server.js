@@ -64,6 +64,7 @@ app.get("/api/health", (req, res) => {
     service: "landhelpcenter-api",
     node: process.version,
     vercel: Boolean(process.env.VERCEL),
+    storage: googleDriveEnabled ? "google-drive" : (process.env.VERCEL ? "not-configured" : "local-dev"),
     database,
     timestamp: new Date().toISOString()
   });
@@ -189,6 +190,7 @@ if (!db.siteSettings.uiLabels || typeof db.siteSettings.uiLabels !== "object") d
 if (!db.siteSettings.homepage || typeof db.siteSettings.homepage !== "object") db.siteSettings.homepage = {};
 if (!db.siteSettings.colors || typeof db.siteSettings.colors !== "object") db.siteSettings.colors = {};
 if (typeof db.siteSettings.logoUrl !== "string") db.siteSettings.logoUrl = "";
+if (typeof db.siteSettings.logoDriveFileId !== "string") db.siteSettings.logoDriveFileId = "";
 // Older installations stored the logo in the public uploads directory.  Keep
 // it working, but now expose only the currently configured logo.
 if (db.siteSettings.logoUrl.startsWith("/uploads/")) db.siteSettings.logoUrl = `/api/public/logo/${path.basename(db.siteSettings.logoUrl)}`;
@@ -291,13 +293,8 @@ function createOtp(userId, purpose, channel) {
 }
 const sessions = new Map();
 
-const cloudStorageEnabled = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
-const SUPABASE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "cms-documents";
 const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || "";
-// Google Drive is an optional replacement for document storage. Personal
-// Google Drive accounts use OAuth; a Workspace Shared Drive may alternatively
-// use a service account. All credentials stay only in Vercel Environment
-// Variables and must never be committed.
+// Final production storage: Google Drive only. Credentials stay in Vercel Environment Variables.
 const googleDriveOAuthEnabled = Boolean(
   GOOGLE_DRIVE_FOLDER_ID && process.env.GOOGLE_DRIVE_CLIENT_ID &&
   process.env.GOOGLE_DRIVE_CLIENT_SECRET && process.env.GOOGLE_DRIVE_REFRESH_TOKEN
@@ -309,11 +306,10 @@ const googleDriveServiceAccountEnabled = Boolean(
 const googleDriveEnabled = googleDriveOAuthEnabled || googleDriveServiceAccountEnabled;
 let googleAccessToken = null;
 let googleAccessTokenExpiresAt = 0;
-let bucketReadyPromise = null;
 
 function base64url(value) { return Buffer.from(value).toString("base64url"); }
 async function googleDriveToken() {
-  if (!googleDriveEnabled) throw new Error("Google Drive is not configured");
+  if (!googleDriveEnabled) throw new Error("Google Drive storage is not configured");
   if (googleAccessToken && googleAccessTokenExpiresAt > Date.now() + 60 * 1000) return googleAccessToken;
   if (googleDriveOAuthEnabled) {
     const body = new URLSearchParams({
@@ -350,67 +346,33 @@ async function googleDriveToken() {
   googleAccessTokenExpiresAt = Date.now() + Math.max(60, Number(result.expires_in || 3600) - 60) * 1000;
   return googleAccessToken;
 }
-async function putGoogleDriveFile(name, file) {
+async function putGoogleDriveFile(name, file, metadata = {}) {
+  if (!googleDriveEnabled) throw new Error("Google Drive storage is not configured");
   const boundary = `cms-${crypto.randomBytes(12).toString("hex")}`;
-  const metadata = JSON.stringify({ name, parents: [GOOGLE_DRIVE_FOLDER_ID] });
+  const driveMetadata = JSON.stringify({
+    name,
+    parents: [GOOGLE_DRIVE_FOLDER_ID],
+    description: String(metadata.description || "").slice(0, 1000),
+    appProperties: { orderId: String(metadata.orderId || ""), customerId: String(metadata.customerId || "") }
+  });
   const body = Buffer.concat([
-    Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n--${boundary}\r\nContent-Type: ${file.mimetype || "application/octet-stream"}\r\n\r\n`),
+    Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${driveMetadata}\r\n--${boundary}\r\nContent-Type: ${file.mimetype || "application/octet-stream"}\r\n\r\n`),
     file.buffer,
     Buffer.from(`\r\n--${boundary}--`)
   ]);
-  const response = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true", {
-    method: "POST", headers: { Authorization: `Bearer ${await googleDriveToken()}`, "Content-Type": `multipart/related; boundary=${boundary}` }, body
+  const response = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,size", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${await googleDriveToken()}`, "Content-Type": `multipart/related; boundary=${boundary}` },
+    body
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok || !result.id) throw new Error(`Google Drive upload failed (${response.status})`);
   return result.id;
 }
 async function getGoogleDriveFile(fileId) {
-  const response = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`, { headers: { Authorization: `Bearer ${await googleDriveToken()}` } });
-  if (!response.ok) return null;
-  return Buffer.from(await response.arrayBuffer());
-}
-
-// Vercel's local filesystem is temporary.  Production uploads therefore go to
-// the connected Supabase Storage bucket; local development keeps using /uploads.
-async function ensureCloudBucket() {
-  if (!cloudStorageEnabled) return false;
-  if (!bucketReadyPromise) bucketReadyPromise = (async () => {
-    const response = await fetch(`${process.env.SUPABASE_URL}/storage/v1/bucket`, {
-      method: "POST",
-      headers: {
-        apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ id: SUPABASE_BUCKET, name: SUPABASE_BUCKET, public: false })
-    });
-    // A duplicate-bucket response simply means a previous request created it.
-    if (!response.ok && response.status !== 409) throw new Error(`Storage bucket unavailable (${response.status})`);
-    return true;
-  })();
-  return bucketReadyPromise;
-}
-function cloudObjectPath(key) {
-  return key.split("/").map(encodeURIComponent).join("/");
-}
-async function putCloudFile(key, file) {
-  await ensureCloudBucket();
-  const response = await fetch(`${process.env.SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${cloudObjectPath(key)}`, {
-    method: "POST",
-    headers: {
-      apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": file.mimetype || "application/octet-stream",
-      "x-upsert": "false"
-    },
-    body: file.buffer
-  });
-  if (!response.ok) throw new Error(`Storage upload failed (${response.status})`);
-}
-async function getCloudFile(key) {
-  const response = await fetch(`${process.env.SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${cloudObjectPath(key)}`, {
-    headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}` }
+  if (!fileId) return null;
+  const response = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`, {
+    headers: { Authorization: `Bearer ${await googleDriveToken()}` }
   });
   if (!response.ok) return null;
   return Buffer.from(await response.arrayBuffer());
@@ -424,7 +386,7 @@ const diskStorage = multer.diskStorage({
   }
 });
 const upload = multer({
-  storage: (googleDriveEnabled || cloudStorageEnabled) ? multer.memoryStorage() : diskStorage,
+  storage: googleDriveEnabled ? multer.memoryStorage() : diskStorage,
   limits: { fileSize: 50 * 1024 * 1024, files: 10 },
   fileFilter: (req, file, cb) => {
     const allowed = new Set([
@@ -437,19 +399,18 @@ const upload = multer({
     cb(null, true);
   }
 });
-async function saveUploadedFiles(files, uploadedBy, orderId) {
+async function saveUploadedFiles(files, uploadedBy, orderId, orderNo = "") {
   const saved = [];
+  if (process.env.VERCEL && !googleDriveEnabled) throw new Error("Google Drive storage is not configured. Configure the required Vercel Environment Variables before uploading files.");
   for (const f of files || []) {
     const safe = path.basename(f.originalname || "file").replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "file";
-    const storedName = (googleDriveEnabled || cloudStorageEnabled) ? `${Date.now()}-${crypto.randomBytes(10).toString("hex")}-${safe}` : f.filename;
-    const driveFileId = googleDriveEnabled ? await putGoogleDriveFile(`order-${orderId}-${storedName}`, f) : null;
-    if (!googleDriveEnabled && cloudStorageEnabled) await putCloudFile(`orders/${orderId}/${storedName}`, f);
-    saved.push({
-      id: crypto.randomBytes(10).toString("hex"), orderId, originalName: f.originalname,
-      storedName, storage: googleDriveEnabled ? "google-drive" : (cloudStorageEnabled ? "supabase" : "local"), driveFileId,
-      mimeType: f.mimetype || "application/octet-stream", size: f.size,
-      uploadedBy: uploadedBy.id, uploadedByName: uploadedBy.name, uploadedAt: new Date().toISOString()
-    });
+    if (googleDriveEnabled) {
+      const storedName = `${Date.now()}-${crypto.randomBytes(10).toString("hex")}-${safe}`;
+      const driveFileId = await putGoogleDriveFile(`orders-${orderNo || orderId}-${storedName}`, f, { orderId, customerId: uploadedBy.customerId, description: `Land Help Center order ${orderNo || orderId}` });
+      saved.push({ id: crypto.randomBytes(10).toString("hex"), orderId, originalName: f.originalname, storedName, storage: "google-drive", driveFileId, mimeType: f.mimetype || "application/octet-stream", size: f.size, uploadedBy: uploadedBy.id, uploadedByName: uploadedBy.name, uploadedAt: new Date().toISOString() });
+    } else {
+      saved.push({ id: crypto.randomBytes(10).toString("hex"), orderId, originalName: f.originalname, storedName: f.filename, storage: "local", driveFileId: null, mimeType: f.mimetype || "application/octet-stream", size: f.size, uploadedBy: uploadedBy.id, uploadedByName: uploadedBy.name, uploadedAt: new Date().toISOString() });
+    }
   }
   return saved;
 }
@@ -830,7 +791,7 @@ app.post("/api/orders", auth, upload.array("files", 10), async (req, res) => {
     details, formData, formFields: JSON.parse(JSON.stringify(s.formFields || [])), files: [], amount, status: "PENDING", createdAt: new Date().toISOString(),
     approvedBy: null, approvedAt: null, note: "", couponCode: coupon?.code || "", couponPercent: coupon?.percent || 0
   };
-  o.files = await saveUploadedFiles(req.files, req.user, o.id);
+  o.files = await saveUploadedFiles(req.files, req.user, o.id, o.orderNo);
   db.orders.push(o);
   db.users.filter(u => ["ADMIN", "MANAGER"].includes(u.role)).forEach(u => notify(u.id, `${o.customerId} নতুন Order করেছেন: ${o.orderNo}`, { category: "general", kind: "order", targetId: o.id, customerId: o.customerId }));
   save();
@@ -845,7 +806,7 @@ app.post("/api/orders/:id/files", auth, staff, upload.array("files", 10), async 
   if (!o) return res.status(404).json({ error: "Order not found" });
   if (!req.files?.length) return res.status(400).json({ error: "একটি বা একাধিক file নির্বাচন করুন" });
   if (!Array.isArray(o.files)) o.files = [];
-  const added = await saveUploadedFiles(req.files, req.user, o.id);
+  const added = await saveUploadedFiles(req.files, req.user, o.id, o.orderNo);
   o.files.push(...added); save();
   res.json({ success: true, files: added, order: o });
 });
@@ -861,14 +822,7 @@ app.get("/api/files/:fileId", auth, async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(f.originalName)}`);
     return res.send(content);
   }
-  if (f.storage === "supabase") {
-    const content = await getCloudFile(`orders/${o.id}/${f.storedName}`);
-    if (!content) return res.status(404).json({ error: "Stored file not found" });
-    res.setHeader("Content-Type", f.mimeType || "application/octet-stream");
-    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(f.originalName)}`);
-    return res.send(content);
-  }
-  const full = path.join(UPLOAD_DIR, f.storedName);
+    const full = path.join(UPLOAD_DIR, f.storedName);
   if (!fs.existsSync(full)) return res.status(404).json({ error: "Stored file not found" });
   res.download(full, f.originalName);
 });
@@ -1139,8 +1093,9 @@ app.post("/api/admin/site-settings/logo", auth, admin, upload.single("logo"), as
   if (!req.file) return res.status(400).json({ error: "একটি image নির্বাচন করুন" });
   if (!String(req.file.mimetype || "").startsWith("image/")) return res.status(400).json({ error: "শুধু image file গ্রহণ করা হয়" });
   const safe = path.basename(req.file.originalname || "logo").replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "logo";
-  const storedName = cloudStorageEnabled ? `${Date.now()}-${crypto.randomBytes(10).toString("hex")}-${safe}` : req.file.filename;
-  if (cloudStorageEnabled) await putCloudFile(`logos/${storedName}`, req.file);
+  if (process.env.VERCEL && !googleDriveEnabled) return res.status(503).json({ error: "Google Drive storage is not configured" });
+  const storedName = googleDriveEnabled ? `${Date.now()}-${crypto.randomBytes(10).toString("hex")}-${safe}` : req.file.filename;
+  if (googleDriveEnabled) { const driveFileId = await putGoogleDriveFile(`logo-${storedName}`, req.file, { description: "Land Help Center active website logo" }); db.siteSettings.logoDriveFileId = driveFileId; }
   db.siteSettings.logoUrl = `/api/public/logo/${storedName}`;
   save(); res.json({ success: true, logoUrl: db.siteSettings.logoUrl });
 });
@@ -1151,8 +1106,8 @@ app.get("/api/public/logo/:name", async (req, res) => {
   const expected = path.basename(String(db.siteSettings?.logoUrl || ""));
   const name = path.basename(req.params.name);
   if (!expected || name !== expected) return res.status(404).end();
-  if (cloudStorageEnabled) {
-    const content = await getCloudFile(`logos/${name}`);
+  if (googleDriveEnabled && db.siteSettings.logoDriveFileId) {
+    const content = await getGoogleDriveFile(db.siteSettings.logoDriveFileId);
     if (!content) return res.status(404).end();
     res.setHeader("Cache-Control", "public, max-age=3600");
     res.type(path.extname(name));
