@@ -720,7 +720,7 @@ app.delete("/api/services/:id", auth, admin, (req, res) => {
 });
 
 // ---------- Top-up ----------
-app.post("/api/topups", auth, (req, res) => {
+app.post("/api/topups", auth, async (req, res) => {
   const { method, amount, transactionId } = req.body || {};
   const a = Number(amount);
   if (!["bKash", "Nagad", "Cash"].includes(method)) {
