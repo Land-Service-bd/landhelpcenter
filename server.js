@@ -140,7 +140,22 @@ if (!Array.isArray(db.supportMessages)) db.supportMessages = [];
 if (!Array.isArray(db.passwordResetCodes)) db.passwordResetCodes = [];
 if (!Array.isArray(db.notifications)) db.notifications = [];
 if (!Array.isArray(db.coupons)) db.coupons = [];
-function notify(userId, text, target = {}) { const kind = target.kind || "general"; db.notifications.push({ id: crypto.randomBytes(8).toString("hex"), userId, text: String(text).slice(0, 500), category: target.category || (kind === "support" || kind === "password-reset" ? "message" : "general"), kind, targetId: target.targetId ?? null, customerId: target.customerId ?? null, read: false, createdAt: new Date().toISOString() }); }
+function notify(userId, text, target = {}) {
+  const kind = target.kind || "general";
+  const messageKinds = new Set(["support", "password-reset", "sms", "message"]);
+  const category = target.category || (messageKinds.has(kind) ? "message" : "general");
+  db.notifications.push({
+    id: crypto.randomBytes(8).toString("hex"),
+    userId,
+    text: String(text).slice(0, 500),
+    category,
+    kind,
+    targetId: target.targetId ?? null,
+    customerId: target.customerId ?? null,
+    read: false,
+    createdAt: new Date().toISOString()
+  });
+}
 if (!db.siteSettings) db.siteSettings = { headerTitle: "Customer Management", headerSubtitle: "Phase 5 — Order System", footerText: "Customer Management System • Phase 5 • Order + Top-up", uiLabels: {}, homepage: {}, colors: {}, logoUrl: "", replyFee: 0 };
 if (!db.siteSettings.uiLabels || typeof db.siteSettings.uiLabels !== "object") db.siteSettings.uiLabels = {};
 if (!db.siteSettings.homepage || typeof db.siteSettings.homepage !== "object") db.siteSettings.homepage = {};
@@ -954,8 +969,27 @@ app.post("/api/support/messages", auth, (req, res) => {
   save();
   res.json({ success: true });
 });
-app.get("/api/notifications", auth, (req, res) => { if (!Array.isArray(db.notifications)) db.notifications = []; res.json(db.notifications.filter(n => n && n.userId === req.user.id).slice(-100).reverse()); });
-app.post("/api/notifications/:id/read", auth, (req, res) => { const n = (db.notifications || []).find(x => x.id === req.params.id && x.userId === req.user.id); if (!n) return res.status(404).json({ error: "Notification পাওয়া যায়নি" }); n.read = true; n.readAt = new Date().toISOString(); save(); res.json({ success: true }); });
+app.get("/api/notifications", auth, (req, res) => {
+  if (!Array.isArray(db.notifications)) db.notifications = [];
+  res.json(db.notifications.filter(n => n && n.userId === req.user.id).slice(-100).reverse());
+});
+app.post("/api/notifications/read", auth, (req, res) => {
+  const now = new Date().toISOString();
+  let count = 0;
+  (db.notifications || []).forEach(n => {
+    if (n && n.userId === req.user.id && !n.read) { n.read = true; n.readAt = now; count++; }
+  });
+  save();
+  res.json({ success: true, count });
+});
+app.post("/api/notifications/:id/read", auth, (req, res) => {
+  const n = (db.notifications || []).find(x => x.id === req.params.id && x.userId === req.user.id);
+  if (!n) return res.status(404).json({ error: "Notification পাওয়া যায়নি" });
+  n.read = true;
+  n.readAt = new Date().toISOString();
+  save();
+  res.json({ success: true });
+});
 app.get("/api/admin/coupons", auth, admin, (req, res) => res.json(db.coupons));
 app.post("/api/admin/coupons", auth, admin, (req, res) => {
   const code = String(req.body?.code || "").trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "");
