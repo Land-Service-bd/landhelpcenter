@@ -59,14 +59,12 @@ app.use(express.json({ limit: "2mb" }));
 // can be diagnosed from Vercel even when the application state is unavailable.
 app.get("/api/health", (req, res) => {
   const database = process.env.POSTGRES_URL ? "postgres-configured" : "local-json-fallback";
-  const documentStorage = googleDriveEnabled ? "google-drive" : (cloudStorageEnabled ? "supabase" : "local-files");
   res.json({
     ok: true,
     service: "landhelpcenter-api",
     node: process.version,
     vercel: Boolean(process.env.VERCEL),
     database,
-    documentStorage,
     timestamp: new Date().toISOString()
   });
 });
