@@ -331,7 +331,7 @@ async function googleDriveToken() {
   const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
   const claim = base64url(JSON.stringify({
     iss: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    scope: "https://www.googleapis.com/auth/drive.file",
+    scope: "https://www.googleapis.com/auth/drive",
     aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600
   }));
   const signer = crypto.createSign("RSA-SHA256");
@@ -861,7 +861,7 @@ app.post("/api/orders/:id/reply", auth, upload.array("files", 10), async (req, r
     db.transactions.push({ id: nextId("transaction"), userId: req.user.id, type: "ORDER_REPLY_FEE", amount: -replyFee, balanceAfter: req.user.balance, reference: o.orderNo, createdAt: new Date().toISOString() });
   }
   if (!Array.isArray(o.files)) o.files = [];
-  const files = await saveUploadedFiles(req.files, req.user, o.id);
+  const files = await saveUploadedFiles(req.files, req.user, o.id, o.orderNo);
   o.files.push(...files);
   o.customerReply = { message, files: files.map(f => f.id), fee: replyFee, status: "PENDING", createdAt: new Date().toISOString() };
   db.users.filter(u => ["ADMIN", "MANAGER"].includes(u.role)).forEach(u => notify(u.id, `${o.customerId} একটি Order Reply পাঠিয়েছেন`, { category: "general", kind: "order-reply", targetId: o.id, customerId: o.customerId }));
@@ -1102,6 +1102,26 @@ app.post("/api/admin/site-settings/logo", auth, admin, upload.single("logo"), as
 
 // Documents are never public URLs.  The existing authenticated /api/files/:id
 // route authorizes each download.  Only the active public logo is exposed here.
+app.get("/api/admin/storage-health", auth, admin, async (req, res) => {
+  const result = {
+    storage: googleDriveEnabled ? "google-drive" : "not-configured",
+    database: statePool ? "postgres" : "local-json-fallback",
+    driveFolderConfigured: Boolean(GOOGLE_DRIVE_FOLDER_ID)
+  };
+  if (!googleDriveEnabled) return res.json(result);
+  try {
+    const token = await googleDriveToken();
+    const response = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(GOOGLE_DRIVE_FOLDER_ID)}?fields=id,name,mimeType&supportsAllDrives=true`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const folder = await response.json().catch(() => ({}));
+    if (!response.ok) return res.status(503).json({ ...result, ok: false, error: "Google Drive folder is not accessible" });
+    return res.json({ ...result, ok: true, folder });
+  } catch (error) {
+    return res.status(503).json({ ...result, ok: false, error: "Google Drive connection failed" });
+  }
+});
+
 app.get("/api/public/logo/:name", async (req, res) => {
   const expected = path.basename(String(db.siteSettings?.logoUrl || ""));
   const name = path.basename(req.params.name);
