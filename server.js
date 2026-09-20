@@ -187,7 +187,23 @@ if (!db.siteSettings.topupConfig || typeof db.siteSettings.topupConfig !== "obje
 if (!Array.isArray(db.siteSettings.topupConfig.others)) db.siteSettings.topupConfig.others = [];
 if (!db.managerPermissions || typeof db.managerPermissions !== "object") db.managerPermissions = { orders: true, topups: true, services: true, support: true, replies: true };
 if (!db.next.supportMessage) db.next.supportMessage = 1;
-const statePool = process.env.POSTGRES_URL ? new Pool({ connectionString: process.env.POSTGRES_URL, ssl: { rejectUnauthorized: false } }) : null;
+function normalizePostgresUrl(value) {
+  if (!value) return "";
+  try {
+    const url = new URL(value);
+    // pg's connection-string parser can let sslmode in the URL override the
+    // explicit ssl object. Strip SSL query options so Vercel/Supabase-style
+    // certificates do not fail with a self-signed certificate-chain error.
+    ["sslmode", "sslcert", "sslkey", "sslrootcert", "sslcrl"].forEach(key => url.searchParams.delete(key));
+    return url.toString();
+  } catch {
+    return String(value).replace(/([?&])sslmode=[^&]*/i, "$1").replace(/[?&]$/, "");
+  }
+}
+const POSTGRES_CONNECTION_STRING = normalizePostgresUrl(process.env.POSTGRES_URL);
+const statePool = POSTGRES_CONNECTION_STRING
+  ? new Pool({ connectionString: POSTGRES_CONNECTION_STRING, ssl: { rejectUnauthorized: false } })
+  : null;
 let stateReadyPromise;
 let writeQueue = Promise.resolve();
 function normalizeState() {
