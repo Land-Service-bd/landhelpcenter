@@ -58,7 +58,7 @@ app.use(express.json({ limit: "2mb" }));
 // Keep this endpoint before database initialization so a broken DB connection
 // can be diagnosed from Vercel even when the application state is unavailable.
 app.get("/api/health", (req, res) => {
-  const database = process.env.POSTGRES_URL ? "postgres-configured" : "local-json-fallback";
+  const database = statePool ? "postgres-configured" : (googleDriveEnabled ? "google-drive-state" : "local-json-fallback");
   res.json({
     ok: true,
     service: "landhelpcenter-api",
@@ -66,26 +66,37 @@ app.get("/api/health", (req, res) => {
     vercel: Boolean(process.env.VERCEL),
     storage: googleDriveEnabled ? "google-drive" : (process.env.VERCEL ? "not-configured" : "local-dev"),
     database,
+    durableState: Boolean(statePool || googleDriveEnabled),
     timestamp: new Date().toISOString()
   });
 });
 // On Vercel, restore the persistent PostgreSQL state before any route reads it.
 app.use(async (req, res, next) => {
   try {
+    // Wait for any previous request's persistence write before reading state.
+    await writeQueue;
     await ensureState();
-    // Vercel can route consecutive requests to different warm instances.
-    // Refresh authoritative PostgreSQL state on each request so sessions,
-    // balances, orders, top-ups and notifications stay visible everywhere.
+    // Vercel can route consecutive requests to different instances. Refresh
+    // the authoritative shared state on every request so login sessions,
+    // registrations, orders, balances and notifications stay visible everywhere.
     if (statePool) {
       const latest = await statePool.query("select payload from cms_app_state where state_key = 'primary'");
       if (latest.rowCount) {
         db = latest.rows[0].payload;
         normalizeState();
       }
+    } else if (googleDriveEnabled) {
+      const latest = await loadGoogleDriveState();
+      if (latest) {
+        db = latest;
+        normalizeState();
+      }
+    } else if (process.env.VERCEL) {
+      return res.status(503).json({ error: "Persistent storage is not configured. Configure Google Drive storage (or PostgreSQL) in Vercel Environment Variables." });
     }
     next();
   }
-  catch (error) { console.error("Database initialization failed:", error.message); res.status(503).json({ error: "Database is temporarily unavailable" }); }
+  catch (error) { console.error("Persistent state initialization failed:", error.message); res.status(503).json({ error: "Persistent storage is temporarily unavailable" }); }
 });
 app.use(express.static(path.join(__dirname, "public"), { dotfiles: "deny", index: false }));
 
@@ -219,6 +230,8 @@ const statePool = POSTGRES_CONNECTION_STRING
   : null;
 let stateReadyPromise;
 let writeQueue = Promise.resolve();
+const GOOGLE_DRIVE_STATE_FILE_NAME = process.env.GOOGLE_DRIVE_STATE_FILE_NAME || "landhelpcenter-state.json";
+let googleDriveStateFileId = process.env.GOOGLE_DRIVE_STATE_FILE_ID || "";
 function normalizeState() {
   (db.services || []).forEach(s => { if (!Array.isArray(s.formFields)) s.formFields = []; if (typeof s.allowExtraFiles !== "boolean") s.allowExtraFiles = false; if (!Number.isFinite(Number(s.businessDiscountPercent))) s.businessDiscountPercent = 0; });
   (db.orders || []).forEach(o => { if (!Array.isArray(o.files)) o.files = []; if (!o.formData) o.formData = {}; });
@@ -231,27 +244,52 @@ function normalizeState() {
   if (!db.sessions || typeof db.sessions !== "object") db.sessions = {};
 }
 async function ensureState() {
-  if (!statePool) return;
-  if (!stateReadyPromise) stateReadyPromise = (async () => {
-    await statePool.query("create table if not exists cms_app_state (state_key text primary key, payload jsonb not null, updated_at timestamptz not null default now())");
-    const saved = await statePool.query("select payload from cms_app_state where state_key = 'primary'");
-    if (saved.rowCount) db = saved.rows[0].payload;
-    else {
-      const seed = fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE, "utf8")) : createInitialDB();
-      db = seed;
-      await statePool.query("insert into cms_app_state (state_key, payload) values ('primary', $1::jsonb)", [JSON.stringify(db)]);
+  if (stateReadyPromise) return stateReadyPromise;
+  stateReadyPromise = (async () => {
+    if (statePool) {
+      await statePool.query("create table if not exists cms_app_state (state_key text primary key, payload jsonb not null, updated_at timestamptz not null default now())");
+      const saved = await statePool.query("select payload from cms_app_state where state_key = 'primary'");
+      if (saved.rowCount) db = saved.rows[0].payload;
+      else {
+        const seed = fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE, "utf8")) : createInitialDB();
+        db = seed;
+        await statePool.query("insert into cms_app_state (state_key, payload) values ('primary', $1::jsonb)", [JSON.stringify(db)]);
+      }
+      normalizeState();
+      return;
+    }
+    if (googleDriveEnabled) {
+      const saved = await loadGoogleDriveState();
+      if (saved) db = saved;
+      else {
+        normalizeState();
+        await saveGoogleDriveState(db);
+      }
+      normalizeState();
+      return;
     }
     normalizeState();
-  })();
+  })().catch(error => {
+    stateReadyPromise = null;
+    throw error;
+  });
   return stateReadyPromise;
 }
 function save() {
-  if (!statePool) { fs.mkdirSync(path.dirname(DB_FILE), { recursive: true }); fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); return Promise.resolve(); }
+  if (!statePool && !googleDriveEnabled) {
+    fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+    return Promise.resolve();
+  }
   // Serialize writes so concurrent serverless requests never overwrite each other.
   writeQueue = writeQueue.then(async () => {
     await ensureState();
-    await statePool.query("update cms_app_state set payload = $1::jsonb, updated_at = now() where state_key = 'primary'", [JSON.stringify(db)]);
-  }).catch(error => console.error("Database save failed:", error.message));
+    if (statePool) {
+      await statePool.query("update cms_app_state set payload = $1::jsonb, updated_at = now() where state_key = 'primary'", [JSON.stringify(db)]);
+    } else {
+      await saveGoogleDriveState(db);
+    }
+  }).catch(error => console.error("Persistent state save failed:", error.message));
   return writeQueue;
 }
 function nextId(k) {
@@ -378,6 +416,51 @@ async function getGoogleDriveFile(fileId) {
   return Buffer.from(await response.arrayBuffer());
 }
 
+async function loadGoogleDriveState() {
+  if (!googleDriveEnabled) return null;
+  const token = await googleDriveToken();
+  if (!googleDriveStateFileId) {
+    const q = `name = '${GOOGLE_DRIVE_STATE_FILE_NAME.replace(/'/g, "\\'")}' and '${GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false`;
+    const response = await fetch(`https://www.googleapis.com/drive/v3/files?corpora=allDrives&includeItemsFromAllDrives=true&supportsAllDrives=true&q=${encodeURIComponent(q)}&fields=files(id,name,mimeType,modifiedTime)&pageSize=1`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(`Google Drive state lookup failed (${response.status})`);
+    googleDriveStateFileId = result.files?.[0]?.id || "";
+  }
+  if (!googleDriveStateFileId) return null;
+  const content = await getGoogleDriveFile(googleDriveStateFileId);
+  if (!content) {
+    googleDriveStateFileId = "";
+    return null;
+  }
+  try { return JSON.parse(content.toString("utf8")); }
+  catch { throw new Error("Google Drive state file is invalid JSON"); }
+}
+
+async function saveGoogleDriveState(nextState) {
+  if (!googleDriveEnabled) throw new Error("Google Drive storage is not configured");
+  const token = await googleDriveToken();
+  const body = Buffer.from(JSON.stringify(nextState));
+  let response;
+  if (googleDriveStateFileId) {
+    response = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(googleDriveStateFileId)}?uploadType=media&supportsAllDrives=true`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body
+    });
+  } else {
+    const file = { originalname: GOOGLE_DRIVE_STATE_FILE_NAME, mimetype: "application/json", buffer: body, size: body.length };
+    googleDriveStateFileId = await putGoogleDriveFile(GOOGLE_DRIVE_STATE_FILE_NAME, file, { description: "Land Help Center durable application state" });
+    return googleDriveStateFileId;
+  }
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Google Drive state save failed (${response.status})${detail ? `: ${detail.slice(0, 300)}` : ""}`);
+  }
+  return googleDriveStateFileId;
+}
+
 const diskStorage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
@@ -432,6 +515,13 @@ function revokeSessions(userId) {
 function auth(req, res, next) {
   const u = currentUser(req);
   if (!u) return res.status(401).json({ error: "Login required" });
+  // Keep an active login alive across normal refreshes while still expiring
+  // abandoned sessions after 30 days.
+  if (session.expiresAt - Date.now() < 7 * 24 * 60 * 60 * 1000) {
+    session.expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000;
+    if (t && db.sessions?.[t]) db.sessions[t].expiresAt = session.expiresAt;
+    save();
+  }
   req.user = u;
   next();
 }
@@ -539,7 +629,7 @@ app.post("/api/customer/login", authRateLimit, async (req, res) => {
     return res.status(401).json({ error: "Username/Mobile অথবা Password ভুল" });
   }
   const t = token();
-  const session = { userId: u.id, expiresAt: Date.now() + 8 * 60 * 60 * 1000 };
+  const session = { userId: u.id, expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000 };
   sessions.set(t, session);
   if (!db.sessions) db.sessions = {};
   db.sessions[t] = session;
@@ -728,6 +818,7 @@ app.post("/api/topups/:id/approve", auth, staff, (req, res) => {
   t.reviewedBy = req.user.id;
   t.reviewedAt = new Date().toISOString();
   u.balance = Number(u.balance) + Number(t.amount);
+  notify(u.id, `আপনার Top-up ${t.amount} টাকা APPROVED হয়েছে। নতুন Balance: ${u.balance} টাকা`, { category: "general", kind: "topup", targetId: t.id, customerId: u.customerId });
   db.transactions.push({
     id: nextId("transaction"), userId: u.id, type: "TOPUP",
     amount: t.amount, balanceAfter: u.balance, reference: `TOPUP-${t.id}`,
@@ -743,6 +834,7 @@ app.post("/api/topups/:id/reject", auth, staff, (req, res) => {
   t.reviewedBy = req.user.id;
   t.reviewedAt = new Date().toISOString();
   t.reason = req.body.reason || "Rejected";
+  notify(u.id, `আপনার Top-up request ${t.amount} টাকা REJECTED হয়েছে। কারণ: ${t.reason}`, { category: "general", kind: "topup", targetId: t.id, customerId: u.customerId });
   save();
   res.json({ success: true });
 });
@@ -837,12 +929,14 @@ app.post("/api/orders/:id/approve", auth, staff, (req, res) => {
     db.transactions.push({ id: nextId("transaction"), userId: u.id, type: "ORDER", amount: -o.amount, balanceAfter: u.balance, reference: o.orderNo, createdAt: new Date().toISOString() });
   }
   o.status = "APPROVED"; o.approvedBy = req.user.id; o.approvedAt = new Date().toISOString(); o.note = req.body.note || "";
+  notify(o.userId, `${o.orderNo} APPROVED হয়েছে।${o.note ? " Note: " + o.note : ""}`, { category: "general", kind: "order", targetId: o.id, customerId: o.customerId });
   save(); res.json({ success: true, balance: u.balance, order: o });
 });
 app.post("/api/orders/:id/reject", auth, staff, (req, res) => {
   const o = db.orders.find(x => x.id == req.params.id);
   if (!o || o.status !== "PENDING") return res.status(400).json({ error: "Pending order not found" });
   o.status = "REJECTED"; o.approvedBy = req.user.id; o.approvedAt = new Date().toISOString(); o.note = req.body.note || "";
+  notify(o.userId, `${o.orderNo} REJECTED হয়েছে.${o.note ? " Note: " + o.note : ""}`, { category: "general", kind: "order", targetId: o.id, customerId: o.customerId });
   save(); res.json({ success: true });
 });
 // A customer may send one correction reply after an approved order.  Files are
@@ -912,6 +1006,9 @@ app.put("/api/admin/orders/:id", auth, admin, (req, res) => {
   if (req.body.note !== undefined) o.note = String(req.body.note).trim().slice(0, 2000);
   o.status = nextStatus;
   o.updatedAt = new Date().toISOString(); o.updatedBy = req.user.id;
+  if (previousStatus !== nextStatus) {
+    notify(o.userId, `${o.orderNo} status ${nextStatus} হয়েছে.${o.note ? " Note: " + o.note : ""}`, { category: "general", kind: "order", targetId: o.id, customerId: o.customerId });
+  }
   save(); res.json({ success: true, order: o, balance: u.balance });
 });
 app.delete("/api/admin/orders/:id", auth, admin, (req, res) => {
