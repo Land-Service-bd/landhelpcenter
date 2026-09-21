@@ -9,16 +9,19 @@ Google Drive is the final production file storage for customer documents, order 
 4. For a service account, share the target folder with the service-account email as Editor.
 5. Keep all credentials only in Vercel Environment Variables.
 
-## Persistent database
-Set `POSTGRES_URL` to a managed PostgreSQL connection string. Customer accounts, balances, orders, top-ups, notifications and sessions should not depend on Vercel's temporary filesystem.
+## Persistent application state
+Preferred: set `POSTGRES_URL` to a managed PostgreSQL connection string.
+
+If you want Google Drive to be the single durable backend, this version can also store the application state JSON in the same Drive folder. In that mode, customer accounts, balances, orders, top-ups, notifications and login sessions are persisted in `landhelpcenter-state.json` on Google Drive. Do not rely on Vercel's temporary filesystem.
 
 ## Required Vercel variables
-`POSTGRES_URL`
 `GOOGLE_DRIVE_FOLDER_ID`
 and either:
 - `GOOGLE_DRIVE_CLIENT_ID`, `GOOGLE_DRIVE_CLIENT_SECRET`, `GOOGLE_DRIVE_REFRESH_TOKEN`
 or:
 - `GOOGLE_SERVICE_ACCOUNT_EMAIL`, `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY`
+
+For Google Drive-backed state, `POSTGRES_URL` is optional. Optional: `GOOGLE_DRIVE_STATE_FILE_NAME` (defaults to `landhelpcenter-state.json`).
 
 ## Verification
 After adding variables and redeploying:
