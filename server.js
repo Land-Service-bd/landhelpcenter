@@ -404,7 +404,10 @@ async function putGoogleDriveFile(name, file, metadata = {}) {
     body
   });
   const result = await response.json().catch(() => ({}));
-  if (!response.ok || !result.id) throw new Error(`Google Drive upload failed (${response.status})`);
+  if (!response.ok || !result.id) {
+    const detail = result?.error?.message || result?.error?.errors?.[0]?.reason || result?.error?.errors?.[0]?.message || "";
+    throw new Error(`Google Drive upload failed (${response.status})${detail ? `: ${String(detail).slice(0, 500)}` : ""}`);
+  }
   return result.id;
 }
 async function getGoogleDriveFile(fileId) {
@@ -897,13 +900,19 @@ app.get("/api/orders", auth, (req, res) => {
   res.json(list);
 });
 app.post("/api/orders/:id/files", auth, staff, upload.array("files", 10), async (req, res) => {
-  const o = db.orders.find(x => x.id == req.params.id);
-  if (!o) return res.status(404).json({ error: "Order not found" });
-  if (!req.files?.length) return res.status(400).json({ error: "একটি বা একাধিক file নির্বাচন করুন" });
-  if (!Array.isArray(o.files)) o.files = [];
-  const added = await saveUploadedFiles(req.files, req.user, o.id, o.orderNo);
-  o.files.push(...added); save();
-  res.json({ success: true, files: added, order: o });
+  try {
+    const o = db.orders.find(x => x.id == req.params.id);
+    if (!o) return res.status(404).json({ error: "Order not found" });
+    if (!req.files?.length) return res.status(400).json({ error: "একটি বা একাধিক file নির্বাচন করুন" });
+    if (!Array.isArray(o.files)) o.files = [];
+    const added = await saveUploadedFiles(req.files, req.user, o.id, o.orderNo);
+    o.files.push(...added);
+    await save();
+    res.json({ success: true, files: added, order: o });
+  } catch (error) {
+    console.error("Order file upload failed:", error);
+    res.status(502).json({ error: error?.message || "File upload failed" });
+  }
 });
 app.get("/api/files/:fileId", auth, async (req, res) => {
   const o = db.orders.find(x => Array.isArray(x.files) && x.files.some(f => f.id === req.params.fileId));
