@@ -349,7 +349,7 @@ function base64url(value) { return Buffer.from(value).toString("base64url"); }
 async function googleDriveToken() {
   if (!googleDriveEnabled) throw new Error("Google Drive storage is not configured");
   if (googleAccessToken && googleAccessTokenExpiresAt > Date.now() + 60 * 1000) return googleAccessToken;
-  if (googleDriveOAuthEnabled) {
+  if (googleDriveOAuthEnabled && !googleDriveServiceAccountEnabled) {
     const body = new URLSearchParams({
       client_id: process.env.GOOGLE_DRIVE_CLIENT_ID,
       client_secret: process.env.GOOGLE_DRIVE_CLIENT_SECRET,
@@ -513,6 +513,8 @@ function revokeSessions(userId) {
   for (const [key, session] of Object.entries(db.sessions)) if (session.userId === userId) delete db.sessions[key];
 }
 function auth(req, res, next) {
+  const t = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  const session = t ? (sessions.get(t) || db.sessions?.[t]) : null;
   const u = currentUser(req);
   if (!u) return res.status(401).json({ error: "Login required" });
   // Keep an active login alive across normal refreshes while still expiring
@@ -584,7 +586,6 @@ function aggregates() {
   };
 }
 
-app.get("/api/health", (req, res) => res.json({ ok: true, phase: "5.3" }));
 app.get("/api/site-settings", (req, res) => res.json(db.siteSettings));
 
 // ---------- Authentication ----------
@@ -834,6 +835,8 @@ app.post("/api/topups/:id/reject", auth, staff, (req, res) => {
   t.reviewedBy = req.user.id;
   t.reviewedAt = new Date().toISOString();
   t.reason = req.body.reason || "Rejected";
+  const u = db.users.find(x => x.id === t.userId);
+  if (!u || !isClient(u)) return res.status(400).json({ error: "Customer not found" });
   notify(u.id, `আপনার Top-up request ${t.amount} টাকা REJECTED হয়েছে। কারণ: ${t.reason}`, { category: "general", kind: "topup", targetId: t.id, customerId: u.customerId });
   save();
   res.json({ success: true });
@@ -1202,7 +1205,7 @@ app.post("/api/admin/site-settings/logo", auth, admin, upload.single("logo"), as
 app.get("/api/admin/storage-health", auth, admin, async (req, res) => {
   const result = {
     storage: googleDriveEnabled ? "google-drive" : "not-configured",
-    database: statePool ? "postgres" : "local-json-fallback",
+    database: statePool ? "postgres" : (googleDriveEnabled ? "google-drive-state" : "local-json-fallback"),
     driveFolderConfigured: Boolean(GOOGLE_DRIVE_FOLDER_ID)
   };
   if (!googleDriveEnabled) return res.json(result);
