@@ -349,7 +349,7 @@ function base64url(value) { return Buffer.from(value).toString("base64url"); }
 async function googleDriveToken() {
   if (!googleDriveEnabled) throw new Error("Google Drive storage is not configured");
   if (googleAccessToken && googleAccessTokenExpiresAt > Date.now() + 60 * 1000) return googleAccessToken;
-  if (googleDriveOAuthEnabled && !googleDriveServiceAccountEnabled) {
+  if (googleDriveOAuthEnabled) {
     const body = new URLSearchParams({
       client_id: process.env.GOOGLE_DRIVE_CLIENT_ID,
       client_secret: process.env.GOOGLE_DRIVE_CLIENT_SECRET,
