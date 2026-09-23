@@ -360,7 +360,7 @@ async function googleDriveToken() {
       method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body
     });
     const result = await response.json().catch(() => ({}));
-    if (!response.ok || !result.access_token) throw new Error(`Google Drive authentication failed (${response.status})`);
+    if (!response.ok || !result.access_token) { const detail = result?.error_description || result?.error || ""; throw new Error(`Google Drive authentication failed (${response.status})${detail ? `: ${String(detail).slice(0, 300)}` : ""}`); }
     googleAccessToken = result.access_token;
     googleAccessTokenExpiresAt = Date.now() + Math.max(60, Number(result.expires_in || 3600) - 60) * 1000;
     return googleAccessToken;
